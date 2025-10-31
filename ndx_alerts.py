@@ -1,25 +1,26 @@
 # ============================================================
-# 📊 NDX Alerts Bot - Production (robuste + analyse + actus)
+# 📊 NDX Alerts Bot - Production (Hard Finnhub AM + analyse + actus)
 # Envois Paris: 08h, 09h, 10h, 12h, 14h, 16h, 20h (jours US)
-# Sélection dynamique du symbole (matin QQQ, US hours ^NDX), fallback NQ=F
+# Matin (<14:30 Paris): force QQQ via Finnhub pour prix frais, fallback Yahoo/Stooq
+# Après 14:30: priorité ^NDX via Yahoo (fallbacks QQQ/NQ=F/^IXIC/SPY/Finnhub)
 # Analyse technique + contexte actus (Reuters/CNBC RSS) + sizing & niveaux
 # ============================================================
 
 import os, sys, time, re
 from datetime import datetime, timezone, time as dt_time
-from pandas_datareader import data as pdr
 import numpy as np
 import pandas as pd
 import requests
 import pytz, holidays
 import yfinance as yf
 import feedparser
+from pandas_datareader import data as pdr
 
 # ---------------- Config ----------------
 TG_TOKEN = os.getenv("TG_TOKEN", "")
 TG_CHAT  = os.getenv("TG_CHAT", "")
 
-PRIMARY_SYMBOL = os.getenv("SYMBOL_PRICE", "^NDX")   # ^NDX (indice) ou QQQ (ETF)
+PRIMARY_SYMBOL = os.getenv("SYMBOL_PRICE", "^NDX")     # ^NDX (indice) ou QQQ (ETF)
 DASHBOARD_URL  = os.getenv("DASHBOARD_URL", "")
 CAPITAL_USD    = float(os.getenv("CAPITAL_USD", "100000"))
 NEWS_WINDOW_MIN = int(os.getenv("NEWS_WINDOW_MIN", "180"))  # fenêtre actus (min)
@@ -27,7 +28,7 @@ NEWS_WINDOW_MIN = int(os.getenv("NEWS_WINDOW_MIN", "180"))  # fenêtre actus (mi
 TZ_PARIS = pytz.timezone("Europe/Paris")
 TZ_NY    = pytz.timezone("America/New_York")
 
-TRIGGER_HOURS = {8, 9, 10, 12, 14, 16, 20}          # heures Paris
+TRIGGER_HOURS = {8, 11, 12, 14, 16, 20}            # heures Paris
 
 # Stratégie
 LEV, SL_PCT, TP_PCT, RISK = 20.0, -0.009, 0.022, 0.02  # SL -0.9%, TP +2.2%, 2% capital/trade
@@ -102,15 +103,12 @@ def dl_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 def dl_stooq(ticker: str) -> pd.DataFrame:
-    """Fallback Stooq (daily). QQQ.US fonctionne bien ; indices souvent indisponibles."""
+    """Fallback Stooq (daily). QQQ.US fonctionne bien ; indices parfois indisponibles."""
     try:
-        sym = ticker
-        if ticker.upper() == "QQQ":
-            sym = "QQQ.US"
+        sym = "QQQ.US" if ticker.upper() == "QQQ" else ticker
         df = pdr.DataReader(sym, "stooq")
         if df is not None and not df.empty:
             df = df.sort_index()
-            # Harmoniser colonnes (Stooq: Close, Open, High, Low)
             return df
     except Exception as e:
         print("stooq err", ticker, e)
@@ -156,36 +154,55 @@ def dl_robust_any(ticker: str) -> tuple[pd.DataFrame, str]:
         time.sleep(0.8)
     return pd.DataFrame(), "none"
 
-def choose_symbol_by_clock() -> str:
-    t = now_paris().time()
-    return "QQQ" if t < dt_time(14, 30) else (PRIMARY_SYMBOL or "^NDX")
-
+# ---------------- Sélection symbole (Hard Finnhub AM) ----------------
 def get_series_dynamic():
     """
-    Essaie {symbole horaire, QQQ, ^NDX, NQ=F, ^IXIC, SPY} et prend la série la plus fraîche.
-    Renvoie (symbol, df, age_minutes, source_tag).
+    HARD FINNHUB AM:
+      - Avant 14:30 Paris: force QQQ via Finnhub (prix live garanti), puis tente Yahoo si échec.
+      - Après 14:30 Paris: ^NDX (Yahoo), sinon QQQ/NQ=F/^IXIC/SPY (meilleure fraîcheur observée).
+    Retourne (symbol, df, age_min, src_tag).
     """
-    pref = choose_symbol_by_clock()
-    pool = [pref, "QQQ", "^NDX", "NQ=F", "^IXIC", "SPY"]
-    candidates = []
-    [candidates.append(s) for s in pool if s not in candidates]
+    t = now_paris().time()
+    if t < dt_time(14, 30):
+        # 1) Prix live garanti via Finnhub (QQQ)
+        df_fh = finnhub_quote("QQQ")
+        if not df_fh.empty:
+            return "QQQ", df_fh, 0.0, "finnhub"
+        # 2) Si Finnhub indispo, tenter Yahoo/others sur QQQ
+        df_y, src = dl_robust_any("QQQ")
+        if not df_y.empty:
+            last_ts = df_y.index[-1]
+            if last_ts.tz is None: last_ts = last_ts.tz_localize(timezone.utc)
+            age_min = (datetime.now(timezone.utc) - last_ts.tz_convert(timezone.utc)).total_seconds()/60.0
+            return "QQQ", df_y, age_min, src
+        # 3) Derniers recours
+        for sym in ["NQ=F", "^IXIC", "SPY"]:
+            df, src = dl_robust_any(sym)
+            if not df.empty:
+                last_ts = df.index[-1]
+                if last_ts.tz is None: last_ts = last_ts.tz_localize(timezone.utc)
+                age_min = (datetime.now(timezone.utc) - last_ts.tz_convert(timezone.utc)).total_seconds()/60.0
+                return sym, df, age_min, src
+        return None, pd.DataFrame(), 10**9, "none"
 
+    # Après 14:30 Paris → priorité Yahoo sur ^NDX (historique intraday)
+    primary = os.getenv("SYMBOL_PRICE", "^NDX") or "^NDX"
+    pool = [primary, "QQQ", "NQ=F", "^IXIC", "SPY"]
     best = (None, pd.DataFrame(), 10**9, "none")
-    for sym in candidates:
+    for sym in pool:
         df, src = dl_robust_any(sym)
-        if df.empty:
+        if df.empty: 
             continue
         last_ts = df.index[-1]
-        if last_ts.tz is None:
-            last_ts = last_ts.tz_localize(timezone.utc)
+        if last_ts.tz is None: last_ts = last_ts.tz_localize(timezone.utc)
         age_min = (datetime.now(timezone.utc) - last_ts.tz_convert(timezone.utc)).total_seconds()/60.0
         if age_min < best[2]:
             best = (sym, df, age_min, src)
         if age_min <= FRESH_LIMIT_MIN:
             return sym, df, age_min, src
     return best
-    
-# -------------- Actu ---------------
+
+# -------------- Actu (RSS) ---------------
 POS_WORDS = r"(beat|beats|tops|surprise|strong|accelerat|cooling inflation|soft landing|accommodative|dovish|upgrades?)"
 NEG_WORDS = r"(miss|misses|below|weak|slowing|hot inflation|reaccelerat|hawkish|tighten|higher for longer|warning|probe|ban|sanction|downgrades?)"
 FED_WORDS = r"(Powell|FOMC|Fed|Federal Reserve|rate|dot plot|hike|cut|QE|QT|inflation|CPI|PPI|PCE|jobs|payrolls|unemployment)"
@@ -255,7 +272,7 @@ def analyze_news(items):
 
 # ----------- Calculs marché ------------
 def compute_metrics():
-symbol, df, age_min, src_tag = get_series_dynamic()
+    symbol, df, age_min, src_tag = get_series_dynamic()
     if df.empty:
         raise RuntimeError("Données introuvables")
 
@@ -270,15 +287,15 @@ symbol, df, age_min, src_tag = get_series_dynamic()
     macd_sig  = macd_line.ewm(span=9, adjust=False).mean()
     macd, sig = float(macd_line.iloc[-1]), float(macd_sig.iloc[-1])
 
-    # VXN proxy
+    # VXN proxy (vol annualisée à partir des retours 30m/daily)
     rets = closes.pct_change().dropna()
     vxn = float(rets.tail(20).std() * np.sqrt(252) * 100) if len(rets)>=20 else 20.0
     vxn = min(max(vxn, 10), 50)
 
     # US10Y / Put-Call
-    tnx = dl_robust_any("^TNX")
+    tnx, src_tnx = dl_robust_any("^TNX")
     us10y = float(tnx["Close"].iloc[-1])/10.0 if not tnx.empty else 4.30
-    cpc = dl_robust_any("^CPC")
+    cpc, src_cpc = dl_robust_any("^CPC")
     pc  = float(cpc["Close"].dropna().iloc[-1]) if not cpc.empty else 1.00
 
     # RRI
@@ -333,7 +350,8 @@ symbol, df, age_min, src_tag = get_series_dynamic()
                 rri=rri, expo=expo, nominal=nominal, risk_usd=risk_usd,
                 reward_usd=reward_usd, rr=rr, decision=decision, rationale=rationale,
                 last_paris=last_paris, freshness=freshness,
-                analysis_news=analysis_news, news_lines=top_lines, src_tag=src_tag)
+                analysis_news=analysis_news, news_lines=top_lines,
+                src_tag=src_tag)
 
 # -------------- Message ---------------
 def fmt_usd(x: float) -> str:
@@ -342,10 +360,11 @@ def fmt_usd(x: float) -> str:
 
 def build_msg(d: dict) -> str:
     link = f"\n🔗 Dashboard: {DASHBOARD_URL}" if DASHBOARD_URL else ""
+    fresh_line = f"Source prix: {d.get('src_tag','?')} | Fraîcheur: {'OK' if '✅' in d.get('freshness','') else d.get('freshness','')}"
     return (
 f"📈 Nasdaq Plan – Update\n"
 f"Symbole: {d['symbol']}\n"
-f"Source prix: {d.get('src_tag','?')} | Fraîcheur: {'OK' if '✅' in d.get('freshness','') else d.get('freshness','')}\n"
+f"{fresh_line}\n"
 f"Prix: {d['price']:.2f}\n"
 f"SL(-0.9%): {d['sl']:.2f} (ΔSL {d['dist_sl']:.1f} pts) | TP(+2.2%): {d['tp']:.2f} (ΔTP {d['dist_tp']:.1f} pts)\n"
 f"RSI14: {d['rsi']:.1f} | MACD: {d['macd']:.2f}/{d['sig']:.2f} | VXN: {d['vxn']:.1f}% | US10Y: {d['us10y']:.2f}% | P/C: {d['pc']:.2f}\n"
@@ -368,9 +387,8 @@ def main():
         send_tg(build_msg(d))
         print("✅ Message envoyé"); return 0
     except Exception as e:
-        # Filet de sécurité : prévenir plutôt que planter
         msg = f"⚠️ NDX Alerts: run sans envoi – {e}"
-        print(msg); 
+        print(msg)
         if TG_TOKEN and TG_CHAT:
             try: send_tg(msg)
             except: pass
