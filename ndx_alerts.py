@@ -1,6 +1,6 @@
 # ============================================================
 # 📊 NDX Alerts Bot – NDX-first (live synth depuis QQQ si besoin)
-# Envois Paris: 08h, 09h, 10h, 12h, 14h, 16h, 20h (jours US)
+# Envois Paris: 08h, 11h, 12h, 14h, 15h, 16h, 20h (jours US)
 # Matin: prix live via Finnhub QQQ → NDX = QQQ * K (K = Close(^NDX)/Close(QQQ))
 # Après 14:30: ^NDX Yahoo si frais, sinon synthèse QQQ*K
 # Analyse technique + actus (Reuters/CNBC) + distances SL/TP + lien dashboard
