@@ -2,30 +2,44 @@ name: NDX Alerts
 
 on:
   schedule:
-    - cron: "0 * * * *"   # tourne chaque heure (UTC). Le script n'envoie qu'aux heures Paris définies.
+    # Exécution chaque heure (UTC). Le script lui-même filtre pour 08/11/12/14/15/16/20 Paris et jours US.
+    - cron: "0 * * * *"
   workflow_dispatch:
+
+concurrency:
+  group: ndx-alerts
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     env:
+      # --- Secrets obligatoires ---
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
       TG_CHAT:  ${{ secrets.TG_CHAT }}
-      SYMBOL_PRICE: ${{ vars.SYMBOL_PRICE }}   # ex: ^NDX ou QQQ (optionnel)
-      CAPITAL_USD:  ${{ vars.CAPITAL_USD }}    # ex: 100000 (optionnel)
-      DASHBOARD_URL: ${{ vars.DASHBOARD_URL }} # URL GitHub Pages/Netlify (optionnel)
-      NEWS_WINDOW_MIN: ${{ vars.NEWS_WINDOW_MIN }} # ex: 180 (optionnel)
+      # Finnhub pour le mode "Hard Finnhub AM"
+      FINNHUB_TOKEN: ${{ secrets.FINNHUB_TOKEN }}
+
+      # --- Variables optionnelles (Settings → Secrets and variables → Actions → Variables) ---
+      SYMBOL_PRICE:   ${{ vars.SYMBOL_PRICE }}     # ^NDX ou QQQ (le script force QQQ le matin si besoin)
+      CAPITAL_USD:    ${{ vars.CAPITAL_USD }}      # ex: 100000
+      DASHBOARD_URL:  ${{ vars.DASHBOARD_URL }}    # URL Netlify/GitHub Pages
+      NEWS_WINDOW_MIN:${{ vars.NEWS_WINDOW_MIN }}  # ex: 180
+      SHORT_ALLOWED:  ${{ vars.SHORT_ALLOWED }}    # 1 par défaut
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
-        
+
       - name: Install deps (pinned)
         run: |
           pip install --no-cache-dir \
