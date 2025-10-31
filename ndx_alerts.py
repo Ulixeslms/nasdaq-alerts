@@ -1,121 +1,147 @@
 # ============================================================
-# 📊 NDX Alerts Bot - Production (robuste + actus + analyse)
-# Horaires Paris: 08, 09, 10, 12, 14, 16, 20
-# Sélection symbole dynamique (matin: QQQ ; US hours: ^NDX ; fallback NQ=F)
+# 📊 NDX Alerts Bot - Production (robuste + analyse + actus)
+# Envois Paris: 08h, 09h, 10h, 12h, 14h, 16h, 20h (jours US)
+# Sélection dynamique du symbole (matin QQQ, US hours ^NDX), fallback NQ=F
+# Analyse technique + contexte actus (Reuters/CNBC RSS) + sizing & niveaux
 # ============================================================
 
-import os, sys, time, requests, pandas as pd, numpy as np
+import os, sys, time, re
 from datetime import datetime, timezone, time as dt_time
-import pytz, holidays, feedparser, yfinance as yf, re
+import numpy as np
+import pandas as pd
+import requests
+import pytz, holidays
+import yfinance as yf
+import feedparser
 
 # ---------------- Config ----------------
 TG_TOKEN = os.getenv("TG_TOKEN", "")
 TG_CHAT  = os.getenv("TG_CHAT", "")
 
-PRIMARY_SYMBOL = os.getenv("SYMBOL_PRICE", "^NDX")  # valeur par défaut
+PRIMARY_SYMBOL = os.getenv("SYMBOL_PRICE", "^NDX")   # ^NDX (indice) ou QQQ (ETF)
 DASHBOARD_URL  = os.getenv("DASHBOARD_URL", "")
 CAPITAL_USD    = float(os.getenv("CAPITAL_USD", "100000"))
-NEWS_WINDOW_MIN = int(os.getenv("NEWS_WINDOW_MIN", "180"))
+NEWS_WINDOW_MIN = int(os.getenv("NEWS_WINDOW_MIN", "180"))  # fenêtre actus (min)
 
 TZ_PARIS = pytz.timezone("Europe/Paris")
 TZ_NY    = pytz.timezone("America/New_York")
 
-TRIGGER_HOURS = {8, 9, 10, 12, 14, 16, 20}
+TRIGGER_HOURS = {8, 9, 10, 12, 14, 16, 20}          # heures Paris
 
 # Stratégie
-LEV, SL_PCT, TP_PCT, RISK = 20.0, -0.009, 0.022, 0.02
+LEV, SL_PCT, TP_PCT, RISK = 20.0, -0.009, 0.022, 0.02  # SL -0.9%, TP +2.2%, 2% capital/trade
 RRI_HALF, RRI_OUT = 10, 25
 SHORT_ALLOWED = int(os.getenv("SHORT_ALLOWED", "1"))
 
-# Fraîcheur acceptable (minutes)
+# Fraîcheur acceptable (minutes) pour considérer la série "live"
 FRESH_LIMIT_MIN = 90
 
+# Flux d’actus (RSS)
 NEWS_SOURCES = [
     "https://feeds.reuters.com/reuters/businessNews",
     "https://feeds.reuters.com/reuters/technologyNews",
-    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # CNBC Markets
 ]
 
 # ---------------- Utils ----------------
-def now_paris(): return datetime.now(TZ_PARIS)
-def is_us_trading_day(d): return (d.weekday() < 5) and (d.date() not in holidays.US())
+def now_paris() -> datetime:
+    return datetime.now(TZ_PARIS)
 
-def send_tg(text):
-    if not TG_TOKEN or not TG_CHAT: 
-        print("Telegram non configuré"); return
+def is_us_trading_day(d: datetime) -> bool:
+    return (d.weekday() < 5) and (d.date() not in holidays.US())
+
+def send_tg(text: str) -> None:
+    if not TG_TOKEN or not TG_CHAT:
+        print("Telegram non configuré (TG_TOKEN/TG_CHAT)."); return
     try:
         requests.get(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            params={"chat_id": TG_CHAT, "text": text}, timeout=20
+            params={"chat_id": TG_CHAT, "text": text},
+            timeout=20
         )
     except Exception as e:
         print("Telegram error:", e)
 
-def rsi(series, n=14):
+def rsi(series: pd.Series, n: int = 14) -> pd.Series:
     d = series.diff()
     up, dn = d.clip(lower=0), -d.clip(upper=0)
     ru = up.ewm(alpha=1/n, adjust=False).mean()
     rd = dn.ewm(alpha=1/n, adjust=False).mean().replace(0, np.nan)
-    rs = ru/rd
+    rs = ru / rd
     return (100 - 100/(1+rs)).fillna(50)
 
-def ema_1d(arr, n):
+def ema_1d(arr: np.ndarray, n: int) -> pd.Series:
     x = np.asarray(arr, dtype=float).ravel()
     return pd.Series(x).ewm(span=n, adjust=False).mean()
 
-# -------- Téléchargement robuste --------
-def dl_one(ticker, period, interval):
+# -------- Téléchargement ultra-robuste --------
+def dl_one(ticker: str, period: str, interval: str) -> pd.DataFrame:
     try:
-        return yf.download(ticker, period=period, interval=interval,
-                           progress=False, threads=False)
-    except Exception as e:
-        print("yfinance error:", ticker, e)
-        return pd.DataFrame()
-
-def dl_robust(ticker):
-    # essaie plusieurs granularités intraday puis daily
-    for period, interval in [("60d","30m"), ("60d","60m"), ("30d","15m"), ("1y","1d")]:
-        df = dl_one(ticker, period, interval)
-        if not df.empty:
+        df = yf.download(
+            ticker, period=period, interval=interval,
+            progress=False, threads=False, auto_adjust=False, prepost=True
+        )
+        if df is not None and not df.empty:
             return df
+    except Exception as e:
+        print("download err", ticker, period, interval, e)
     return pd.DataFrame()
 
-def choose_symbol_by_clock():
-    # Avant 14:30 Paris → QQQ ; après → ^NDX
+def dl_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    try:
+        df = yf.Ticker(ticker).history(
+            period=period, interval=interval,
+            prepost=True, actions=False, raise_errors=False
+        )
+        if df is not None and not df.empty:
+            cols = {c: c.capitalize() for c in df.columns}
+            return df.rename(columns=cols)
+    except Exception as e:
+        print("history err", ticker, period, interval, e)
+    return pd.DataFrame()
+
+def dl_robust_any(ticker: str) -> pd.DataFrame:
+    # essais intraday → daily (avec double méthode download/history)
+    attempts = [
+        ("60d","30m"), ("60d","60m"), ("30d","15m"),
+        ("7d","5m"),   ("1y","1d")
+    ]
+    for (p,i) in attempts:
+        df = dl_one(ticker, p, i)
+        if not df.empty: return df
+        time.sleep(1.3)
+        df = dl_history(ticker, p, i)
+        if not df.empty: return df
+        time.sleep(1.3)
+    return pd.DataFrame()
+
+def choose_symbol_by_clock() -> str:
+    # Avant 14:30 Paris → QQQ (plus fiable le matin) ; sinon ^NDX (ou valeur choisie)
     t = now_paris().time()
-    if t < dt_time(14, 30):  # avant ouverture US
-        return "QQQ"
-    # sinon utilise le symbole désiré, typiquement ^NDX
-    return PRIMARY_SYMBOL or "^NDX"
+    return "QQQ" if t < dt_time(14, 30) else (PRIMARY_SYMBOL or "^NDX")
 
 def get_series_dynamic():
     """
-    Essaie symbole adapté à l'heure (QQQ le matin, ^NDX l'après-midi),
-    sinon fallback liste: [QQQ, ^NDX, NQ=F]. Retourne (symbole, df, age_min).
+    Essaie {symbole horaire, QQQ, ^NDX, NQ=F} et prend la série la plus fraîche.
+    Renvoie (symbol, df, age_minutes). Peut être "stale" si Yahoo indispo, mais jamais vide si un des tickers répond.
     """
-    candidates = []
     pref = choose_symbol_by_clock()
-    candidates.append(pref)
-    for c in ["QQQ", "^NDX", "NQ=F"]:
-        if c not in candidates:
-            candidates.append(c)
+    candidates = [pref] + [s for s in ["QQQ","^NDX","NQ=F"] if s != pref]
 
     best = (None, pd.DataFrame(), 10**9)
     for sym in candidates:
-        df = dl_robust(sym)
+        df = dl_robust_any(sym)
         if df.empty:
             continue
         last_ts = df.index[-1]
         if last_ts.tz is None:
             last_ts = last_ts.tz_localize(timezone.utc)
         age_min = (datetime.now(timezone.utc) - last_ts.tz_convert(timezone.utc)).total_seconds()/60.0
-        # garde la série la plus fraîche
         if age_min < best[2]:
             best = (sym, df, age_min)
-        # si fraîche, on sort
         if age_min <= FRESH_LIMIT_MIN:
             return sym, df, age_min
-    return best  # peut être "stale" mais jamais vide si un ticker marche
+    return best
 
 # -------------- Actu ---------------
 POS_WORDS = r"(beat|beats|tops|surprise|strong|accelerat|cooling inflation|soft landing|accommodative|dovish|upgrades?)"
@@ -140,15 +166,15 @@ def fetch_recent_news():
                     continue
                 title = getattr(e,"title","")
                 summary = getattr(e,"summary","")
-                items.append((title + " — " + summary))
+                items.append(title + " — " + summary)
         except Exception:
             continue
-    # dédup
+    # dédup basique
     out, seen = [], set()
     for s in items:
-        k = s[:90].lower()
-        if k not in seen:
-            seen.add(k); out.append(s)
+        key = s[:90].lower()
+        if key not in seen:
+            seen.add(key); out.append(s)
     return out[:50]
 
 def analyze_news(items):
@@ -190,6 +216,7 @@ def compute_metrics():
     symbol, df, age_min = get_series_dynamic()
     if df.empty:
         raise RuntimeError("Données introuvables")
+
     closes = df["Close"].dropna()
     last   = float(closes.iloc[-1])
 
@@ -207,9 +234,9 @@ def compute_metrics():
     vxn = min(max(vxn, 10), 50)
 
     # US10Y / Put-Call
-    tnx = dl_robust("^TNX")
+    tnx = dl_robust_any("^TNX")
     us10y = float(tnx["Close"].iloc[-1])/10.0 if not tnx.empty else 4.30
-    cpc = dl_robust("^CPC")
+    cpc = dl_robust_any("^CPC")
     pc  = float(cpc["Close"].dropna().iloc[-1]) if not cpc.empty else 1.00
 
     # RRI
@@ -243,7 +270,7 @@ def compute_metrics():
     else:
         decision, rationale = "HOLD", "Pas de signal fort"
 
-    # Fraîcheur
+    # Fraîcheur / horodatage
     last_ts = df.index[-1]
     if last_ts.tz is None: last_ts = last_ts.tz_localize(timezone.utc)
     last_paris = last_ts.tz_convert(TZ_PARIS).strftime('%Y-%m-%d %H:%M')
@@ -267,11 +294,11 @@ def compute_metrics():
                 analysis_news=analysis_news, news_lines=top_lines)
 
 # -------------- Message ---------------
-def fmt_usd(x):
+def fmt_usd(x: float) -> str:
     try: return f"${x:,.0f}".replace(",", " ")
     except: return f"{x:.0f}"
 
-def build_msg(d):
+def build_msg(d: dict) -> str:
     link = f"\n🔗 Dashboard: {DASHBOARD_URL}" if DASHBOARD_URL else ""
     return (
 f"📈 Nasdaq Plan – Update\n"
@@ -298,9 +325,13 @@ def main():
         send_tg(build_msg(d))
         print("✅ Message envoyé"); return 0
     except Exception as e:
-        # Dernier filet: prévenir au lieu d'échouer silencieusement
-        send_tg(f"⚠️ NDX Alerts: run sans envoi – {e}")
-        print("⚠️ Run sans envoi:", repr(e)); return 0
+        # Filet de sécurité : prévenir plutôt que planter
+        msg = f"⚠️ NDX Alerts: run sans envoi – {e}"
+        print(msg); 
+        if TG_TOKEN and TG_CHAT:
+            try: send_tg(msg)
+            except: pass
+        return 0
 
 if __name__ == "__main__":
     sys.exit(main())
