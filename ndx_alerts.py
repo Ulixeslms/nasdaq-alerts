@@ -7,6 +7,7 @@
 
 import os, sys, time, re
 from datetime import datetime, timezone, time as dt_time
+from pandas_datareader import data as pdr
 import numpy as np
 import pandas as pd
 import requests
@@ -74,7 +75,7 @@ def ema_1d(arr: np.ndarray, n: int) -> pd.Series:
     x = np.asarray(arr, dtype=float).ravel()
     return pd.Series(x).ewm(span=n, adjust=False).mean()
 
-# -------- Téléchargement ultra-robuste --------
+# -------- Téléchargement ultra-robuste (Yahoo → Stooq → Finnhub) --------
 def dl_one(ticker: str, period: str, interval: str) -> pd.DataFrame:
     try:
         df = yf.download(
@@ -100,37 +101,78 @@ def dl_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
         print("history err", ticker, period, interval, e)
     return pd.DataFrame()
 
-def dl_robust_any(ticker: str) -> pd.DataFrame:
-    # essais intraday → daily (avec double méthode download/history)
-    attempts = [
-        ("60d","30m"), ("60d","60m"), ("30d","15m"),
-        ("7d","5m"),   ("1y","1d")
-    ]
-    for (p,i) in attempts:
-        df = dl_one(ticker, p, i)
-        if not df.empty: return df
-        time.sleep(1.3)
-        df = dl_history(ticker, p, i)
-        if not df.empty: return df
-        time.sleep(1.3)
+def dl_stooq(ticker: str) -> pd.DataFrame:
+    """Fallback Stooq (daily). QQQ.US fonctionne bien ; indices souvent indisponibles."""
+    try:
+        sym = ticker
+        if ticker.upper() == "QQQ":
+            sym = "QQQ.US"
+        df = pdr.DataReader(sym, "stooq")
+        if df is not None and not df.empty:
+            df = df.sort_index()
+            # Harmoniser colonnes (Stooq: Close, Open, High, Low)
+            return df
+    except Exception as e:
+        print("stooq err", ticker, e)
     return pd.DataFrame()
 
+def finnhub_quote(ticker: str) -> pd.DataFrame:
+    """Dernier recours temps réel (quote) → DataFrame minimal avec le last."""
+    token = os.getenv("FINNHUB_TOKEN", "")
+    if not token:
+        return pd.DataFrame()
+    try:
+        r = requests.get("https://finnhub.io/api/v1/quote",
+                         params={"symbol": ticker, "token": token}, timeout=15)
+        js = r.json()
+        if "c" in js and js["c"]:
+            ts = pd.to_datetime(datetime.now(timezone.utc))
+            c  = float(js["c"])
+            df = pd.DataFrame({"Close":[c], "Open":[c], "High":[c], "Low":[c]}, index=[ts])
+            return df
+    except Exception as e:
+        print("finnhub err", ticker, e)
+    return pd.DataFrame()
+
+def dl_robust_any(ticker: str) -> tuple[pd.DataFrame, str]:
+    """Renvoie (df, source) parmi: yfinance(download/history), Stooq, Finnhub."""
+    attempts = [
+        ("yfd", lambda: dl_one(ticker,"60d","30m")),
+        ("yfd", lambda: dl_one(ticker,"60d","60m")),
+        ("yfd", lambda: dl_one(ticker,"30d","15m")),
+        ("yfd", lambda: dl_one(ticker,"7d","5m")),
+        ("yfh", lambda: dl_history(ticker,"60d","30m")),
+        ("yfh", lambda: dl_history(ticker,"60d","60m")),
+        ("yfh", lambda: dl_history(ticker,"30d","15m")),
+        ("yfd", lambda: dl_one(ticker,"1y","1d")),
+        ("yfh", lambda: dl_history(ticker,"1y","1d")),
+        ("stooq", lambda: dl_stooq(ticker)),
+        ("finnhub", lambda: finnhub_quote(ticker)),
+    ]
+    for tag, fn in attempts:
+        df = fn()
+        if df is not None and not df.empty:
+            return df, tag
+        time.sleep(0.8)
+    return pd.DataFrame(), "none"
+
 def choose_symbol_by_clock() -> str:
-    # Avant 14:30 Paris → QQQ (plus fiable le matin) ; sinon ^NDX (ou valeur choisie)
     t = now_paris().time()
     return "QQQ" if t < dt_time(14, 30) else (PRIMARY_SYMBOL or "^NDX")
 
 def get_series_dynamic():
     """
-    Essaie {symbole horaire, QQQ, ^NDX, NQ=F} et prend la série la plus fraîche.
-    Renvoie (symbol, df, age_minutes). Peut être "stale" si Yahoo indispo, mais jamais vide si un des tickers répond.
+    Essaie {symbole horaire, QQQ, ^NDX, NQ=F, ^IXIC, SPY} et prend la série la plus fraîche.
+    Renvoie (symbol, df, age_minutes, source_tag).
     """
     pref = choose_symbol_by_clock()
-    candidates = [pref] + [s for s in ["QQQ","^NDX","NQ=F"] if s != pref]
+    pool = [pref, "QQQ", "^NDX", "NQ=F", "^IXIC", "SPY"]
+    candidates = []
+    [candidates.append(s) for s in pool if s not in candidates]
 
-    best = (None, pd.DataFrame(), 10**9)
+    best = (None, pd.DataFrame(), 10**9, "none")
     for sym in candidates:
-        df = dl_robust_any(sym)
+        df, src = dl_robust_any(sym)
         if df.empty:
             continue
         last_ts = df.index[-1]
@@ -138,11 +180,11 @@ def get_series_dynamic():
             last_ts = last_ts.tz_localize(timezone.utc)
         age_min = (datetime.now(timezone.utc) - last_ts.tz_convert(timezone.utc)).total_seconds()/60.0
         if age_min < best[2]:
-            best = (sym, df, age_min)
+            best = (sym, df, age_min, src)
         if age_min <= FRESH_LIMIT_MIN:
-            return sym, df, age_min
+            return sym, df, age_min, src
     return best
-
+    
 # -------------- Actu ---------------
 POS_WORDS = r"(beat|beats|tops|surprise|strong|accelerat|cooling inflation|soft landing|accommodative|dovish|upgrades?)"
 NEG_WORDS = r"(miss|misses|below|weak|slowing|hot inflation|reaccelerat|hawkish|tighten|higher for longer|warning|probe|ban|sanction|downgrades?)"
@@ -213,7 +255,7 @@ def analyze_news(items):
 
 # ----------- Calculs marché ------------
 def compute_metrics():
-    symbol, df, age_min = get_series_dynamic()
+symbol, df, age_min, src_tag = get_series_dynamic()
     if df.empty:
         raise RuntimeError("Données introuvables")
 
@@ -291,7 +333,7 @@ def compute_metrics():
                 rri=rri, expo=expo, nominal=nominal, risk_usd=risk_usd,
                 reward_usd=reward_usd, rr=rr, decision=decision, rationale=rationale,
                 last_paris=last_paris, freshness=freshness,
-                analysis_news=analysis_news, news_lines=top_lines)
+                analysis_news=analysis_news, news_lines=top_lines, src_tag=src_tag)
 
 # -------------- Message ---------------
 def fmt_usd(x: float) -> str:
@@ -303,6 +345,7 @@ def build_msg(d: dict) -> str:
     return (
 f"📈 Nasdaq Plan – Update\n"
 f"Symbole: {d['symbol']}\n"
+f"Source prix: {d.get('src_tag','?')} | Fraîcheur: {'OK' if '✅' in d.get('freshness','') else d.get('freshness','')}\n"
 f"Prix: {d['price']:.2f}\n"
 f"SL(-0.9%): {d['sl']:.2f} (ΔSL {d['dist_sl']:.1f} pts) | TP(+2.2%): {d['tp']:.2f} (ΔTP {d['dist_tp']:.1f} pts)\n"
 f"RSI14: {d['rsi']:.1f} | MACD: {d['macd']:.2f}/{d['sig']:.2f} | VXN: {d['vxn']:.1f}% | US10Y: {d['us10y']:.2f}% | P/C: {d['pc']:.2f}\n"
