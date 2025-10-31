@@ -1,0 +1,19 @@
+name: NDX Alerts
+on:
+  schedule:
+    - cron: "0 * * * *"   # exécute toutes les heures (UTC)
+  workflow_dispatch:       # permet un déclenchement manuel
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT:  ${{ secrets.TG_CHAT }}
+      SYMBOL_PRICE: "^NDX"   # ou "QQQ" si tu préfères l'ETF
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install yfinance pandas numpy pytz requests python-dateutil holidays
+      - run: python ndx_alerts.py
