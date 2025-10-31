@@ -1,43 +1,42 @@
 # ============================================================
-# 📊 NDX Alerts Bot - Production (analyse enrichie + ACTU LIVE)
-# Heures Paris: 08h, 09h, 10h, 12h, 14h, 16h, 20h
-# BUY / HOLD / CLOSE / SELL + Risk sizing, RRI + Analyse macro/tech + Actu presse
+# 📊 NDX Alerts Bot - Production (robuste + actus + analyse)
+# Horaires Paris: 08, 09, 10, 12, 14, 16, 20
+# Sélection symbole dynamique (matin: QQQ ; US hours: ^NDX ; fallback NQ=F)
 # ============================================================
 
 import os, sys, time, requests, pandas as pd, numpy as np
-from datetime import datetime, timezone
-import pytz, holidays, feedparser
-import yfinance as yf
-import re
+from datetime import datetime, timezone, time as dt_time
+import pytz, holidays, feedparser, yfinance as yf, re
 
-# ---------- Config ----------
+# ---------------- Config ----------------
 TG_TOKEN = os.getenv("TG_TOKEN", "")
 TG_CHAT  = os.getenv("TG_CHAT", "")
-PRIMARY_SYMBOL   = os.getenv("SYMBOL_PRICE", "^NDX")   # ou "QQQ"
-FALLBACK_SYMBOL  = "QQQ"
-DASHBOARD_URL    = os.getenv("DASHBOARD_URL", "")
+
+PRIMARY_SYMBOL = os.getenv("SYMBOL_PRICE", "^NDX")  # valeur par défaut
+DASHBOARD_URL  = os.getenv("DASHBOARD_URL", "")
+CAPITAL_USD    = float(os.getenv("CAPITAL_USD", "100000"))
+NEWS_WINDOW_MIN = int(os.getenv("NEWS_WINDOW_MIN", "180"))
+
 TZ_PARIS = pytz.timezone("Europe/Paris")
 TZ_NY    = pytz.timezone("America/New_York")
-TRIGGER_HOURS = {8, 9, 10, 12, 14, 16, 20}            # ← horaires prod
+
+TRIGGER_HOURS = {8, 9, 10, 12, 14, 16, 20}
 
 # Stratégie
 LEV, SL_PCT, TP_PCT, RISK = 20.0, -0.009, 0.022, 0.02
 RRI_HALF, RRI_OUT = 10, 25
-CAPITAL_USD = float(os.getenv("CAPITAL_USD", "100000"))
 SHORT_ALLOWED = int(os.getenv("SHORT_ALLOWED", "1"))
 
-# Fraîcheur des prix & fenêtre actus
+# Fraîcheur acceptable (minutes)
 FRESH_LIMIT_MIN = 90
-NEWS_WINDOW_MIN = int(os.getenv("NEWS_WINDOW_MIN", "180"))
 
-# Flux d’actus (RSS)
 NEWS_SOURCES = [
     "https://feeds.reuters.com/reuters/businessNews",
     "https://feeds.reuters.com/reuters/technologyNews",
-    "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # CNBC Markets
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
 ]
 
-# ---------- Utils ----------
+# ---------------- Utils ----------------
 def now_paris(): return datetime.now(TZ_PARIS)
 def is_us_trading_day(d): return (d.weekday() < 5) and (d.date() not in holidays.US())
 
@@ -45,8 +44,10 @@ def send_tg(text):
     if not TG_TOKEN or not TG_CHAT: 
         print("Telegram non configuré"); return
     try:
-        requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                     params={"chat_id": TG_CHAT, "text": text}, timeout=20)
+        requests.get(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            params={"chat_id": TG_CHAT, "text": text}, timeout=20
+        )
     except Exception as e:
         print("Telegram error:", e)
 
@@ -62,41 +63,63 @@ def ema_1d(arr, n):
     x = np.asarray(arr, dtype=float).ravel()
     return pd.Series(x).ewm(span=n, adjust=False).mean()
 
-def dl_yf(ticker, period, interval, retries=3):
-    last_err = None
-    for _ in range(retries):
-        try:
-            df = yf.download(ticker, period=period, interval=interval,
-                             progress=False, threads=False)
-            if not df.empty: return df
-        except Exception as e: last_err = e
-        time.sleep(2)
-    if last_err: print("yfinance error:", last_err)
+# -------- Téléchargement robuste --------
+def dl_one(ticker, period, interval):
+    try:
+        return yf.download(ticker, period=period, interval=interval,
+                           progress=False, threads=False)
+    except Exception as e:
+        print("yfinance error:", ticker, e)
+        return pd.DataFrame()
+
+def dl_robust(ticker):
+    # essaie plusieurs granularités intraday puis daily
+    for period, interval in [("60d","30m"), ("60d","60m"), ("30d","15m"), ("1y","1d")]:
+        df = dl_one(ticker, period, interval)
+        if not df.empty:
+            return df
     return pd.DataFrame()
 
-def get_fresh_series(symbol):
-    df = dl_yf(symbol, "60d", "30m")
-    if df.empty: df = dl_yf(symbol, "1y", "1d")
-    if df.empty: return None, pd.DataFrame(), 10**9
+def choose_symbol_by_clock():
+    # Avant 14:30 Paris → QQQ ; après → ^NDX
+    t = now_paris().time()
+    if t < dt_time(14, 30):  # avant ouverture US
+        return "QQQ"
+    # sinon utilise le symbole désiré, typiquement ^NDX
+    return PRIMARY_SYMBOL or "^NDX"
 
-    last_ts = df.index[-1]
-    if last_ts.tz is None: last_ts = last_ts.tz_localize(timezone.utc)
-    age_min = (datetime.now(timezone.utc) - last_ts.tz_convert(timezone.utc)).total_seconds()/60.0
+def get_series_dynamic():
+    """
+    Essaie symbole adapté à l'heure (QQQ le matin, ^NDX l'après-midi),
+    sinon fallback liste: [QQQ, ^NDX, NQ=F]. Retourne (symbole, df, age_min).
+    """
+    candidates = []
+    pref = choose_symbol_by_clock()
+    candidates.append(pref)
+    for c in ["QQQ", "^NDX", "NQ=F"]:
+        if c not in candidates:
+            candidates.append(c)
 
-    if (age_min > FRESH_LIMIT_MIN) and (symbol == PRIMARY_SYMBOL):
-        df_fb = dl_yf(FALLBACK_SYMBOL, "60d", "30m")
-        if not df_fb.empty:
-            ts_fb = df_fb.index[-1]
-            if ts_fb.tz is None: ts_fb = ts_fb.tz_localize(timezone.utc)
-            age_min_fb = (datetime.now(timezone.utc) - ts_fb.tz_convert(timezone.utc)).total_seconds()/60.0
-            if age_min_fb < age_min:
-                return FALLBACK_SYMBOL, df_fb, age_min_fb
+    best = (None, pd.DataFrame(), 10**9)
+    for sym in candidates:
+        df = dl_robust(sym)
+        if df.empty:
+            continue
+        last_ts = df.index[-1]
+        if last_ts.tz is None:
+            last_ts = last_ts.tz_localize(timezone.utc)
+        age_min = (datetime.now(timezone.utc) - last_ts.tz_convert(timezone.utc)).total_seconds()/60.0
+        # garde la série la plus fraîche
+        if age_min < best[2]:
+            best = (sym, df, age_min)
+        # si fraîche, on sort
+        if age_min <= FRESH_LIMIT_MIN:
+            return sym, df, age_min
+    return best  # peut être "stale" mais jamais vide si un ticker marche
 
-    return symbol, df, age_min
-
-# ---------- Actu live & analyse IA ----------
-POS_WORDS = r"(beat|beats|tops|surprise|strong|accelerat|cooling inflation|soft landing|cuts guidance up|raise guidance|accommodative|dovish)"
-NEG_WORDS = r"(miss|misses|below|weak|slowing|hot inflation|reaccelerat|hawkish|tighten|higher for longer|warning|probe|ban|sanction|escalat)"
+# -------------- Actu ---------------
+POS_WORDS = r"(beat|beats|tops|surprise|strong|accelerat|cooling inflation|soft landing|accommodative|dovish|upgrades?)"
+NEG_WORDS = r"(miss|misses|below|weak|slowing|hot inflation|reaccelerat|hawkish|tighten|higher for longer|warning|probe|ban|sanction|downgrades?)"
 FED_WORDS = r"(Powell|FOMC|Fed|Federal Reserve|rate|dot plot|hike|cut|QE|QT|inflation|CPI|PPI|PCE|jobs|payrolls|unemployment)"
 MEGA_WORDS = r"(Nvidia|NVDA|Apple|AAPL|Microsoft|MSFT|Alphabet|GOOGL|GOOG|Meta|META|Amazon|AMZN|Tesla|TSLA|Broadcom|AVGO)"
 
@@ -107,69 +130,70 @@ def fetch_recent_news():
         try:
             feed = feedparser.parse(url)
             for e in feed.entries[:30]:
-                # pubDate handling
                 ts = None
                 for k in ("published_parsed","updated_parsed"):
-                    if getattr(e, k, None):
+                    if getattr(e,k, None):
                         ts = datetime(*getattr(e,k)[:6], tzinfo=timezone.utc).timestamp()
                         break
-                if ts is None: 
-                    ts = datetime.now(timezone.utc).timestamp()
+                ts = ts or datetime.now(timezone.utc).timestamp()
                 if ts < cutoff:
                     continue
-                title = e.title if hasattr(e,"title") else ""
-                summary = e.summary if hasattr(e,"summary") else ""
-                text = (title + " — " + summary)
-                items.append(text)
-        except Exception as ex:
+                title = getattr(e,"title","")
+                summary = getattr(e,"summary","")
+                items.append((title + " — " + summary))
+        except Exception:
             continue
-    return items[:50]
+    # dédup
+    out, seen = [], set()
+    for s in items:
+        k = s[:90].lower()
+        if k not in seen:
+            seen.add(k); out.append(s)
+    return out[:50]
 
 def analyze_news(items):
     if not items:
-        return dict(score=0, label="neutre", bullets=["Actu calme dans la fenêtre"], drivers="RAS")
-
+        return dict(score=0, label="neutre", bullets=["Actu calme"], drivers="RAS")
     txt = " ".join(items).lower()
     pos = len(re.findall(POS_WORDS, txt))
     neg = len(re.findall(NEG_WORDS, txt))
     fed = len(re.findall(FED_WORDS, txt))
-    mega = len(re.findall(MEGA_WORDS, txt))
+    mega= len(re.findall(MEGA_WORDS, txt))
 
-    # heuristique de score : pos - neg, pénalité si news Fed hawkish
     score = pos - neg
     if fed>0 and ("hawkish" in txt or "hot inflation" in txt or "higher for longer" in txt):
         score -= 2
-    if mega>0 and ("miss" in txt or "probe" in txt or "ban" in txt):
+    if mega>0 and any(w in txt for w in ["miss","probe","ban","downgrade"]):
         score -= 1
 
     label = "neutre"
-    if score >= 2: label = "vent porteur"
-    elif score <= -2: label = "vent de face"
+    if score>=2: label="vent porteur"
+    elif score<=-2: label="vent de face"
 
-    # Construit 3 bullets maximum (titres “compilés”)
     bullets = []
     for s in items[:3]:
-        s = re.sub(r"\s+", " ", s)
+        s = re.sub(r"\s+"," ", s)
         bullets.append("• " + (s[:180] + ("…" if len(s)>180 else "")))
 
-    # Drivers détectés (hauts niveaux)
     drivers = []
     if fed>0: drivers.append("Fed/taux")
     if mega>0: drivers.append("méga-caps tech")
-    if "earnings" in txt or "results" in txt: drivers.append("résultats")
-    if "cpi" in txt or "ppi" in txt or "pce" in txt or "inflation" in txt: drivers.append("inflation")
-    if "geopolit" in txt or "sanction" in txt or "ban " in txt: drivers.append("geopolitique/régulation")
+    if any(k in txt for k in ["earnings","results","guidance"]): drivers.append("résultats")
+    if any(k in txt for k in ["cpi","ppi","pce","inflation"]): drivers.append("inflation")
+    if any(k in txt for k in ["geopolit","sanction","ban "]): drivers.append("géopolitique/régulation")
     if not drivers: drivers.append("mix news")
+
     return dict(score=score, label=label, bullets=bullets, drivers=", ".join(drivers))
 
-# ---------- Calculs marché ----------
+# ----------- Calculs marché ------------
 def compute_metrics():
-    symbol, df, age_min = get_fresh_series(PRIMARY_SYMBOL)
-    if df.empty: raise RuntimeError("Aucune donnée disponible.")
+    symbol, df, age_min = get_series_dynamic()
+    if df.empty:
+        raise RuntimeError("Données introuvables")
     closes = df["Close"].dropna()
     last   = float(closes.iloc[-1])
 
-    # RSI & MACD
+    # RSI/MACD
     rsi14 = float(rsi(closes).iloc[-1])
     carr  = closes.to_numpy(dtype=float).ravel()
     ema12 = ema_1d(carr, 12); ema26 = ema_1d(carr, 26)
@@ -183,42 +207,29 @@ def compute_metrics():
     vxn = min(max(vxn, 10), 50)
 
     # US10Y / Put-Call
-    tnx = dl_yf("^TNX", "5d", "1d")
-    us10y = float(tnx["Close"].iloc[-1]) / 10.0 if not tnx.empty else 4.30
-    cpc = dl_yf("^CPC", "10d", "1d")
+    tnx = dl_robust("^TNX")
+    us10y = float(tnx["Close"].iloc[-1])/10.0 if not tnx.empty else 4.30
+    cpc = dl_robust("^CPC")
     pc  = float(cpc["Close"].dropna().iloc[-1]) if not cpc.empty else 1.00
 
-    # Tendance (EMA50/200)
-    ema50  = float(ema_1d(carr, 50).iloc[-1]) if len(carr)>=50 else np.nan
-    ema200 = float(ema_1d(carr, 200).iloc[-1]) if len(carr)>=200 else np.nan
-    trend = "haussière" if (not np.isnan(ema50) and not np.isnan(ema200) and ema50 >= ema200) else "neutre/baissière"
+    # RRI
+    rri = (0.25*(rsi14>70) + 0.25*(vxn>22) + 0.20*(macd<sig) +
+           0.15*(us10y>4.5) + 0.15*(pc>1.1)) * 100
 
-    # Gap vs veille (daily)
-    daily = dl_yf(symbol, "5d", "1d")
-    gap_pct = np.nan
-    if len(daily)>=2:
-        prev_close = float(daily["Close"].iloc[-2])
-        gap_pct = float((last/prev_close - 1)*100)
-
-    # RRI (pondérations définies)
-    rri = (0.25*(rsi14>70) + 0.25*(vxn>22) + 0.20*(macd<sig) + 0.15*(us10y>4.5) + 0.15*(pc>1.1)) * 100
-
-    # Niveaux & exposition
-    sl = last * (1 + SL_PCT)
-    tp = last * (1 + TP_PCT)
-    dist_to_sl = last - sl
-    dist_to_tp = tp - last
-    expo_cap = RISK / (abs(SL_PCT) * LEV)      # ~0.111
-    base = 1.0 if rri <= RRI_HALF else (0.5 if rri <= RRI_OUT else 0.0)
+    # Niveaux/expo
+    sl = last*(1+SL_PCT); tp = last*(1+TP_PCT)
+    dist_to_sl = last - sl; dist_to_tp = tp - last
+    expo_cap = RISK/(abs(SL_PCT)*LEV)       # ≈ 0.111
+    base = 1.0 if rri<=RRI_HALF else (0.5 if rri<=RRI_OUT else 0.0)
     expo = min(base, expo_cap)
 
     # Sizing
-    nominal    = CAPITAL_USD * expo * LEV
-    risk_usd   = CAPITAL_USD * expo * abs(SL_PCT) * LEV
-    reward_usd = CAPITAL_USD * expo * TP_PCT * LEV
-    rr         = (reward_usd / risk_usd) if risk_usd > 0 else np.nan
+    nominal = CAPITAL_USD*expo*LEV
+    risk_usd = CAPITAL_USD*expo*abs(SL_PCT)*LEV
+    reward_usd = CAPITAL_USD*expo*TP_PCT*LEV
+    rr = (reward_usd/risk_usd) if risk_usd>0 else np.nan
 
-    # Décision (règles)
+    # Décision
     if rri > RRI_OUT:
         decision, rationale = "CLOSE (FLAT)", "RRI > seuil sortie"
     elif (rri <= RRI_HALF) and (macd >= sig) and (45 <= rsi14 <= 70):
@@ -238,19 +249,11 @@ def compute_metrics():
     last_paris = last_ts.tz_convert(TZ_PARIS).strftime('%Y-%m-%d %H:%M')
     freshness = "✅ données fraîches" if age_min <= FRESH_LIMIT_MIN else f"⚠️ données âgées ~{age_min:.0f} min"
 
-    # Actu & analyse IA
+    # Actu
     news = fetch_recent_news()
     news_ai = analyze_news(news)
-
-    # Ajustements micro en fonction de l’actu
-    news_adj = []
-    if news_ai["label"] == "vent de face":
-        news_adj.append("Actu négative → éviter pyramider, privilégier demi-expo ou hedge léger.")
-        if decision == "BUY": decision, rationale = "HOLD", "Actu: vent de face (prudence)"
-    elif news_ai["label"] == "vent porteur":
-        news_adj.append("Actu positive → OK pour pleine expo si RRI faible ; trailing si extension.")
-    else:
-        news_adj.append("Actu neutre → plan inchangé.")
+    if news_ai["label"] == "vent de face" and decision == "BUY":
+        decision, rationale = "HOLD", "Actu: vent de face (prudence)"
 
     analysis_news = f"Contexte actus: {news_ai['label']} (score {news_ai['score']}) ; drivers: {news_ai['drivers']}"
     top_lines = "\n".join(news_ai["bullets"])
@@ -263,7 +266,7 @@ def compute_metrics():
                 last_paris=last_paris, freshness=freshness,
                 analysis_news=analysis_news, news_lines=top_lines)
 
-# ---------- Message ----------
+# -------------- Message ---------------
 def fmt_usd(x):
     try: return f"${x:,.0f}".replace(",", " ")
     except: return f"{x:.0f}"
@@ -285,19 +288,19 @@ f"Horodatage (Paris): {now_paris().strftime('%Y-%m-%d %H:%M %Z')} | Dernier poin
 f"{link}"
 )
 
-# ---------- Main ----------
+# ---------------- Main -----------------
 def main():
     try:
         now = now_paris()
         if now.hour not in TRIGGER_HOURS or not is_us_trading_day(now):
-            print("⏱ Pas l'heure / jour non US → exit 0"); return 0
+            print("⏱ Pas l'heure/jour US → exit 0"); return 0
         d = compute_metrics()
         send_tg(build_msg(d))
         print("✅ Message envoyé"); return 0
     except Exception as e:
-        print("⚠️ Run sans envoi:", repr(e))
+        # Dernier filet: prévenir au lieu d'échouer silencieusement
         send_tg(f"⚠️ NDX Alerts: run sans envoi – {e}")
-        return 0
+        print("⚠️ Run sans envoi:", repr(e)); return 0
 
 if __name__ == "__main__":
     sys.exit(main())
